@@ -28,10 +28,10 @@ const firebaseConfig = {
     measurementId: process.env.FIREBASE_MEASUREMENT_ID
 };
 
-console.log('Initializing Firebase with config:', {
-    ...firebaseConfig,
-    apiKey: '***' // Hide API key in logs
-});
+// console.log('Initializing Firebase with config:', {
+//     ...firebaseConfig,
+//     apiKey: '***' // Hide API key in logs
+// });
 
 try {
     const app = initializeApp(firebaseConfig);

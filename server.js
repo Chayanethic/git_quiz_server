@@ -299,10 +299,16 @@ app.get('/api/recent/user/:userId', async (req, res) => {
     }
 });
 
-// Root endpoint
-app.get('/', (req, res) => {
-    res.status(200).json({ message: 'Welcome to the Quiz API', version: '1.0' });
-});
+// // Root endpoint
+// app.get('/', (req, res) => {
+//     res.status(200).json({ message: 'Welcome to the Quiz API', version: '1.0' });
+// });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+app.get("/", (req, res) => {
+    res.send(`Hello from Express on Vercel!${PORT}`);
+  });
+  
+  // Export the app (No app.listen)
+module.exports = app;
