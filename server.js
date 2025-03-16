@@ -64,16 +64,16 @@ app.post('/api/create_content', async (req, res) => {
     const numOptions = Math.min(parseInt(num_options) || 4, 4);
 
     try {
-        console.log('Generating content with parameters:', {
-            text: text.substring(0, 50) + '...',
-            question_type,
-            numOptions,
-            numQuestions,
-            include_flashcards
-        });
+        // console.log('Generating content with parameters:', {
+        //     text: text.substring(0, 50) + '...',
+        //     question_type,
+        //     numOptions,
+        //     numQuestions,
+        //     include_flashcards
+        // });
 
         const content = await generateContent(text, question_type, numOptions, numQuestions, include_flashcards === true);
-        console.log('Generated content structure:', JSON.stringify(content, null, 2));
+        // console.log('Generated content structure:', JSON.stringify(content, null, 2));
 
         const quizId = generateQuizId();
         
@@ -114,7 +114,7 @@ app.post('/api/create_content', async (req, res) => {
             flashcards: flashcards
         };
 
-        console.log('Attempting to save quiz data:', JSON.stringify(quizData, null, 2));
+        // console.log('Attempting to save quiz data:', JSON.stringify(quizData, null, 2));
 
         const quizRef = collection(db, 'quizzes');
         await addDoc(quizRef, quizData);
@@ -193,11 +193,11 @@ app.post('/api/submit_score', async (req, res) => {
         return res.status(400).json({ error: 'Missing required fields: quizId, playerName, score' });
     }
     try {
-        console.log('Attempting to save score:', {
-            quiz_id: quizId,
-            player_name: playerName,
-            score: score
-        });
+        // console.log('Attempting to save score:', {
+        //     quiz_id: quizId,
+        //     player_name: playerName,
+        //     score: score
+        // });
 
         const scoreData = {
             quiz_id: String(quizId),
@@ -206,7 +206,7 @@ app.post('/api/submit_score', async (req, res) => {
             created_at: Timestamp.now()
         };
 
-        console.log('Formatted score data:', scoreData);
+        // console.log('Formatted score data:', scoreData);
 
         const scoresRef = collection(db, 'scores');
         await addDoc(scoresRef, scoreData);
