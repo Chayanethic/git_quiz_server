@@ -3,6 +3,8 @@ const express = require('express');
 const { db } = require('./firebase');
 const { collection, doc, addDoc, getDoc, getDocs, query, where, orderBy, limit, Timestamp } = require('firebase/firestore');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
 
 
 const app = express();
@@ -53,6 +55,130 @@ Return in JSON format, no extra text or markdown:
         };
     }
 };
+
+// Configure multer for file uploads
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 } // Limit file size to 5MB
+});
+
+// Upload PDF and generate questions and flashcards
+app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'No PDF file uploaded' });
+    }
+
+    const { user_id, content_name, num_questions = 10, num_options = 4, include_flashcards = true } = req.body;
+    if (!user_id || !content_name) {
+        return res.status(400).json({ error: 'user_id and content_name are required' });
+    }
+
+    // Validate and limit the number of questions
+    const numQuestions = Math.min(Math.max(parseInt(num_questions) || 10, 1), 50); // Min 1, Max 50 questions
+    const numOptions = Math.min(Math.max(parseInt(num_options) || 4, 2), 6); // Min 2, Max 6 options
+
+    try {
+        // Extract text from PDF
+        const pdfData = await pdfParse(req.file.buffer);
+        const totalPages = pdfData.numpages;
+
+        // Get page range from query parameters
+        const startPage = parseInt(req.query.startPage) || 1;
+        const endPage = parseInt(req.query.endPage) || totalPages;
+
+        // Validate page range
+        const start = Math.max(1, startPage);
+        const end = Math.min(totalPages, endPage);
+
+        if (start > end || start < 1 || end > totalPages) {
+            return res.status(400).json({ 
+                error: 'Invalid page range',
+                totalPages,
+                requestedRange: { start, end }
+            });
+        }
+
+        // Extract text from the specified page range
+        const text = pdfData.text.split('\n').slice((start - 1) * 50, end * 50).join('\n');
+
+        // Generate questions and flashcards using Gemini API
+        const content = await generateContent(text, 'multiple_choice', numOptions, numQuestions, include_flashcards === true);
+
+        // Generate quiz ID and prepare data for database
+        const quizId = generateQuizId();
+
+        // Sanitize and validate questions
+        const questions = content.questions.map(q => {
+            if (!q.question || !q.type || !q.answer) {
+                console.error('Invalid question structure:', q);
+                throw new Error('Invalid question structure');
+            }
+            return {
+                question: String(q.question),
+                type: String(q.type),
+                options: q.type.toLowerCase() === 'multiple_choice' 
+                    ? (Array.isArray(q.options) ? q.options.map(String) : [])
+                    : ['True', 'False'],
+                answer: String(q.answer)
+            };
+        });
+
+        // Sanitize and validate flashcards
+        const flashcards = (content.flashcards || []).map(f => {
+            if (!f.term || !f.definition) {
+                console.error('Invalid flashcard structure:', f);
+                throw new Error('Invalid flashcard structure');
+            }
+            return {
+                term: String(f.term),
+                definition: String(f.definition)
+            };
+        });
+
+        // Prepare quiz data for database
+        const quizData = {
+            quiz_id: String(quizId),
+            content_name: String(content_name),
+            user_id: String(user_id),
+            created_at: Timestamp.now(),
+            source: 'pdf',
+            pdf_details: {
+                total_pages: totalPages,
+                processed_pages: { start, end },
+                num_questions: numQuestions,
+                num_options: numOptions,
+                include_flashcards
+            },
+            questions: questions,
+            flashcards: flashcards
+        };
+
+        // Save to database
+        const quizRef = collection(db, 'quizzes');
+        await addDoc(quizRef, quizData);
+
+        res.status(201).json({ 
+            message: 'Questions and flashcards generated successfully',
+            quiz_id: quizId,
+            quiz_link: `http://localhost:${process.env.PORT}/api/quiz/${quizId}`,
+            content_name,
+            pdf_details: {
+                totalPages,
+                processedPages: { start, end },
+                numQuestions,
+                numOptions,
+                includeFlashcards: include_flashcards
+            },
+            content: { questions, flashcards }
+        });
+    } catch (error) {
+        console.error('Error processing PDF:', error);
+        res.status(500).json({ 
+            error: 'Error processing PDF', 
+            details: error.message 
+        });
+    }
+});
 
 // Create Quiz/Flashcards
 app.post('/api/create_content', async (req, res) => {
