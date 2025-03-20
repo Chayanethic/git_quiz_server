@@ -1,11 +1,10 @@
 require('dotenv').config();
 const express = require('express');
 const { db } = require('./firebase');
-const { collection, doc, addDoc, getDoc, getDocs, query, where, orderBy, limit, Timestamp } = require('firebase/firestore');
+const { collection, doc, addDoc, getDoc, getDocs, query, where, orderBy, limit, Timestamp, updateDoc, setDoc } = require('firebase/firestore');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
-
 
 const app = express();
 app.use(express.json());
@@ -62,6 +61,200 @@ const upload = multer({
     limits: { fileSize: 5 * 1024 * 1024 } // Limit file size to 5MB
 });
 
+// Check if user has remaining free generations or active subscription
+const checkUserUsage = async (userId) => {
+    try {
+        // Check user subscription status
+        const userRef = doc(db, 'users', userId);
+        const userSnap = await getDoc(userRef);
+        
+        if (!userSnap.exists()) {
+            // New user - create profile with initial free generations
+            await setDoc(userRef, {
+                user_id: userId,
+                free_generations_remaining: 10,
+                subscription_status: 'free',
+                subscription_expiry: null,
+                created_at: Timestamp.now()
+            });
+            return { 
+                canGenerate: true, 
+                remainingFree: 10, 
+                subscriptionStatus: 'free' 
+            };
+        }
+        
+        const userData = userSnap.data();
+        
+        // If user has active subscription, allow generation
+        if (userData.subscription_status !== 'free') {
+            // Check if subscription is still valid
+            if (userData.subscription_expiry && userData.subscription_expiry.toDate() > new Date()) {
+                return { 
+                    canGenerate: true, 
+                    remainingFree: 0, 
+                    subscriptionStatus: userData.subscription_status 
+                };
+            } else {
+                // Subscription expired, revert to free
+                await updateDoc(userRef, {
+                    subscription_status: 'free',
+                    subscription_expiry: null
+                });
+                userData.subscription_status = 'free';
+            }
+        }
+        
+        // For free users, check remaining generations
+        if (userData.free_generations_remaining > 0) {
+            return { 
+                canGenerate: true, 
+                remainingFree: userData.free_generations_remaining, 
+                subscriptionStatus: 'free' 
+            };
+        } else {
+            return { 
+                canGenerate: false, 
+                remainingFree: 0, 
+                subscriptionStatus: 'free' 
+            };
+        }
+    } catch (error) {
+        console.error('Error checking user usage:', error);
+        throw error;
+    }
+};
+
+// Decrease free generation count after successful generation
+const decrementFreeUsage = async (userId) => {
+    try {
+        const userRef = doc(db, 'users', userId);
+        const userSnap = await getDoc(userRef);
+        
+        if (userSnap.exists()) {
+            const userData = userSnap.data();
+            if (userData.subscription_status === 'free' && userData.free_generations_remaining > 0) {
+                await updateDoc(userRef, {
+                    free_generations_remaining: userData.free_generations_remaining - 1
+                });
+                return userData.free_generations_remaining - 1;
+            }
+        }
+        return 0;
+    } catch (error) {
+        console.error('Error decrementing free usage:', error);
+        return 0;
+    }
+};
+
+// Get user subscription info
+app.get('/api/user/subscription/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const userRef = doc(db, 'users', userId);
+        const userSnap = await getDoc(userRef);
+        
+        if (!userSnap.exists()) {
+            // New user - create profile with initial free generations
+            await setDoc(userRef, {
+                user_id: userId,
+                free_generations_remaining: 10,
+                subscription_status: 'free',
+                subscription_expiry: null,
+                created_at: Timestamp.now()
+            });
+            
+            return res.status(200).json({
+                user_id: userId,
+                free_generations_remaining: 10,
+                subscription_status: 'free',
+                subscription_expiry: null
+            });
+        }
+        
+        const userData = userSnap.data();
+        
+        // Check if subscription is still valid
+        if (userData.subscription_status !== 'free' && 
+            userData.subscription_expiry && 
+            userData.subscription_expiry.toDate() < new Date()) {
+            // Subscription expired, revert to free
+            await updateDoc(userRef, {
+                subscription_status: 'free',
+                subscription_expiry: null
+            });
+            userData.subscription_status = 'free';
+            userData.subscription_expiry = null;
+        }
+        
+        res.status(200).json({
+            user_id: userId,
+            free_generations_remaining: userData.free_generations_remaining || 0,
+            subscription_status: userData.subscription_status || 'free',
+            subscription_expiry: userData.subscription_expiry ? userData.subscription_expiry.toDate() : null
+        });
+    } catch (err) {
+        console.error('Error fetching user subscription:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Subscribe user to a plan
+app.post('/api/user/subscribe', async (req, res) => {
+    const { userId, plan } = req.body;
+    
+    if (!userId || !plan) {
+        return res.status(400).json({ error: 'User ID and plan are required' });
+    }
+    
+    try {
+        const userRef = doc(db, 'users', userId);
+        const userSnap = await getDoc(userRef);
+        
+        let expiryDate = new Date();
+        
+        // Set expiry date based on plan
+        switch(plan) {
+            case 'monthly':
+                expiryDate.setMonth(expiryDate.getMonth() + 1);
+                break;
+            case 'quarterly':
+                expiryDate.setMonth(expiryDate.getMonth() + 3);
+                break;
+            case 'yearly':
+                expiryDate.setFullYear(expiryDate.getFullYear() + 1);
+                break;
+            default:
+                return res.status(400).json({ error: 'Invalid plan. Choose monthly, quarterly, or yearly.' });
+        }
+        
+        // Create or update user record
+        if (!userSnap.exists()) {
+            await setDoc(userRef, {
+                subscription_status: plan,
+                subscription_expiry: Timestamp.fromDate(expiryDate),
+                free_generations_remaining: 0,
+                created_at: Timestamp.now()
+            });
+        } else {
+            await updateDoc(userRef, {
+                subscription_status: plan,
+                subscription_expiry: Timestamp.fromDate(expiryDate)
+            });
+        }
+        
+        res.status(200).json({
+            user_id: userId,
+            message: 'Subscription successful',
+            plan,
+            subscription_expiry: expiryDate
+        });
+    } catch (err) {
+        console.error('Error creating subscription:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
 // Upload PDF and generate questions and flashcards
 app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
     if (!req.file) {
@@ -73,11 +266,22 @@ app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
         return res.status(400).json({ error: 'user_id and content_name are required' });
     }
 
-    // Validate and limit the number of questions
-    const numQuestions = Math.min(Math.max(parseInt(num_questions) || 10, 1), 50); // Min 1, Max 50 questions
-    const numOptions = Math.min(Math.max(parseInt(num_options) || 4, 2), 6); // Min 2, Max 6 options
-
+    // Check if user can generate content
     try {
+        const usageStatus = await checkUserUsage(user_id);
+        if (!usageStatus.canGenerate) {
+            return res.status(403).json({ 
+                error: 'Generation limit reached', 
+                details: 'You have used all your free generations. Please subscribe to continue.',
+                subscription_status: usageStatus.subscriptionStatus,
+                remaining_free: usageStatus.remainingFree
+            });
+        }
+        
+        // Validate and limit the number of questions
+        const numQuestions = Math.min(Math.max(parseInt(num_questions) || 10, 1), 50); // Min 1, Max 50 questions
+        const numOptions = Math.min(Math.max(parseInt(num_options) || 4, 2), 6); // Min 2, Max 6 options
+
         // Extract text from PDF
         const pdfData = await pdfParse(req.file.buffer);
         const totalPages = pdfData.numpages;
@@ -157,8 +361,15 @@ app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
         const quizRef = collection(db, 'quizzes');
         await addDoc(quizRef, quizData);
 
+        // Now decrement the free usage count if user is on free plan
+        let remainingFree = usageStatus.remainingFree;
+        if (usageStatus.subscriptionStatus === 'free') {
+            remainingFree = await decrementFreeUsage(user_id);
+        }
+
         res.status(201).json({ 
             message: 'Questions and flashcards generated successfully',
+            user_id: user_id,
             quiz_id: quizId,
             quiz_link: `http://localhost:${process.env.PORT}/api/quiz/${quizId}`,
             content_name,
@@ -169,6 +380,8 @@ app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
                 numOptions,
                 includeFlashcards: include_flashcards
             },
+            subscription_status: usageStatus.subscriptionStatus,
+            remaining_free: remainingFree,
             content: { questions, flashcards }
         });
     } catch (error) {
@@ -186,21 +399,23 @@ app.post('/api/create_content', async (req, res) => {
     if (!text || !question_type || !content_name || !user_id) {
         return res.status(400).json({ error: 'Text, question_type, content_name, and user_id are required' });
     }
-    const numQuestions = Math.min(parseInt(num_questions) || 1, 10);
-    const numOptions = Math.min(parseInt(num_options) || 4, 4);
-
+    
+    // Check if user can generate content
     try {
-        // console.log('Generating content with parameters:', {
-        //     text: text.substring(0, 50) + '...',
-        //     question_type,
-        //     numOptions,
-        //     numQuestions,
-        //     include_flashcards
-        // });
+        const usageStatus = await checkUserUsage(user_id);
+        if (!usageStatus.canGenerate) {
+            return res.status(403).json({ 
+                error: 'Generation limit reached', 
+                details: 'You have used all your free generations. Please subscribe to continue.',
+                subscription_status: usageStatus.subscriptionStatus,
+                remaining_free: usageStatus.remainingFree
+            });
+        }
+        
+        const numQuestions = Math.min(parseInt(num_questions) || 1, 10);
+        const numOptions = Math.min(parseInt(num_options) || 4, 4);
 
         const content = await generateContent(text, question_type, numOptions, numQuestions, include_flashcards === true);
-        // console.log('Generated content structure:', JSON.stringify(content, null, 2));
-
         const quizId = generateQuizId();
         
         // Sanitize and validate questions
@@ -240,15 +455,22 @@ app.post('/api/create_content', async (req, res) => {
             flashcards: flashcards
         };
 
-        // console.log('Attempting to save quiz data:', JSON.stringify(quizData, null, 2));
-
         const quizRef = collection(db, 'quizzes');
         await addDoc(quizRef, quizData);
 
+        // Now decrement the free usage count if user is on free plan
+        let remainingFree = usageStatus.remainingFree;
+        if (usageStatus.subscriptionStatus === 'free') {
+            remainingFree = await decrementFreeUsage(user_id);
+        }
+
         res.status(201).json({ 
+            user_id: user_id,
             quiz_id: quizId,
             quiz_link: `http://localhost:${process.env.PORT}/api/quiz/${quizId}`,
             content_name,
+            subscription_status: usageStatus.subscriptionStatus,
+            remaining_free: remainingFree,
             content: { questions, flashcards }
         });
     } catch (err) {
@@ -319,20 +541,12 @@ app.post('/api/submit_score', async (req, res) => {
         return res.status(400).json({ error: 'Missing required fields: quizId, playerName, score' });
     }
     try {
-        // console.log('Attempting to save score:', {
-        //     quiz_id: quizId,
-        //     player_name: playerName,
-        //     score: score
-        // });
-
         const scoreData = {
             quiz_id: String(quizId),
             player_name: String(playerName),
             score: Number(score),
             created_at: Timestamp.now()
         };
-
-        // console.log('Formatted score data:', scoreData);
 
         const scoresRef = collection(db, 'scores');
         await addDoc(scoresRef, scoreData);
@@ -425,17 +639,9 @@ app.get('/api/recent/user/:userId', async (req, res) => {
     }
 });
 
-// // Root endpoint
-// app.get('/', (req, res) => {
-//     res.status(200).json({ message: 'Welcome to the Quiz API', version: '1.0' });
-// });
-
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => {
-    res.send(`Hello from Express on Vercel!${PORT}`);
-  });
 app.listen(PORT, "0.0.0.0", function () {
     console.log(`Server is running on port: ${PORT}`);
-  });
+});
 
