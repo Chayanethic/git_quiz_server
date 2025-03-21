@@ -5,6 +5,9 @@ const { collection, doc, addDoc, getDoc, getDocs, query, where, orderBy, limit, 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -636,6 +639,256 @@ app.get('/api/recent/user/:userId', async (req, res) => {
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Error fetching user recent content' });
+    }
+});
+
+// Ensure uploads directory exists
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+    fs.mkdirSync(uploadsDir);
+}
+
+// Generate mock test questions using Gemini
+const generateMockTest = async (topic, description, difficulty, numQuestions) => {
+    try {
+        const prompt = `
+Generate a mock test with exactly ${numQuestions} questions for the following topic:
+Topic: "${topic}"
+Description: "${description}"
+Difficulty Level: "${difficulty}"
+
+The questions should be challenging and appropriate for the specified difficulty level.
+Return in JSON format with no extra text:
+{
+    "mock_test": {
+        "topic": "${topic}",
+        "difficulty": "${difficulty}",
+        "total_questions": ${numQuestions},
+        "time_allowed": "${Math.ceil(numQuestions * 2)} minutes",
+        "questions": [
+            {
+                "question_number": 1,
+                "question": "question text",
+                "options": ["A) option1", "B) option2", "C) option3", "D) option4"],
+                "correct_answer": "A",
+                "explanation": "detailed explanation"
+            }
+        ]
+    }
+}`;
+
+        const result = await model.generateContent(prompt);
+        const responseText = result.response.text().replace(/```json/g, '').replace(/```/g, '').trim();
+        return JSON.parse(responseText);
+    } catch (error) {
+        console.error('Error generating mock test:', error);
+        throw error;
+    }
+};
+
+// Create PDF from mock test data
+const createMockTestPDF = async (mockTestData, filePath) => {
+    return new Promise((resolve, reject) => {
+        try {
+            const doc = new PDFDocument();
+            const stream = fs.createWriteStream(filePath);
+
+            doc.pipe(stream);
+
+            // Add title
+            doc.fontSize(20).text('Mock Test', { align: 'center' });
+            doc.moveDown();
+
+            // Add test details
+            doc.fontSize(12);
+            doc.text(`Topic: ${mockTestData.mock_test.topic}`);
+            doc.text(`Difficulty: ${mockTestData.mock_test.difficulty}`);
+            doc.text(`Total Questions: ${mockTestData.mock_test.total_questions}`);
+            doc.text(`Time Allowed: ${mockTestData.mock_test.time_allowed}`);
+            doc.moveDown();
+
+            // Add instructions
+            doc.fontSize(14).text('Instructions:', { underline: true });
+            doc.fontSize(12)
+                .text('1. Attempt all questions')
+                .text('2. Each question carries equal marks')
+                .text(`3. Time allowed: ${mockTestData.mock_test.time_allowed}`);
+            doc.moveDown();
+
+            // Add questions
+            mockTestData.mock_test.questions.forEach((q, index) => {
+                doc.fontSize(12).text(`${index + 1}. ${q.question}`);
+                doc.moveDown(0.5);
+                q.options.forEach(option => {
+                    doc.text(option);
+                });
+                doc.moveDown();
+            });
+
+            // Add answer key (separate page)
+            doc.addPage();
+            doc.fontSize(16).text('Answer Key', { align: 'center' });
+            doc.moveDown();
+            mockTestData.mock_test.questions.forEach((q, index) => {
+                doc.fontSize(12)
+                    .text(`${index + 1}. Correct Answer: ${q.correct_answer}`)
+                    .text(`Explanation: ${q.explanation}`)
+                    .moveDown();
+            });
+
+            doc.end();
+
+            stream.on('finish', () => {
+                resolve(filePath);
+            });
+
+            stream.on('error', reject);
+        } catch (error) {
+            reject(error);
+        }
+    });
+};
+
+// Generate Mock Test API
+app.post('/api/mock-test/generate', async (req, res) => {
+    const { topic, description, difficulty, num_questions, user_id } = req.body;
+
+    if (!topic || !description || !difficulty || !num_questions || !user_id) {
+        return res.status(400).json({
+            error: 'Missing required fields',
+            required: ['topic', 'description', 'difficulty', 'num_questions', 'user_id']
+        });
+    }
+
+    try {
+        // Check user usage/subscription
+        const usageStatus = await checkUserUsage(user_id);
+        if (!usageStatus.canGenerate) {
+            return res.status(403).json({
+                error: 'Generation limit reached',
+                details: 'You have used all your free generations. Please subscribe to continue.',
+                subscription_status: usageStatus.subscriptionStatus,
+                remaining_free: usageStatus.remainingFree
+            });
+        }
+
+        // Generate mock test questions
+        const mockTestData = await generateMockTest(
+            topic,
+            description,
+            difficulty,
+            Math.min(Math.max(parseInt(num_questions) || 10, 5), 50) // Min 5, Max 50 questions
+        );
+
+        // Generate unique test ID
+        const testId = generateQuizId();
+        const pdfFileName = `mock_test_${testId}.pdf`;
+        const pdfFilePath = path.join(uploadsDir, pdfFileName);
+
+        // Create PDF
+        await createMockTestPDF(mockTestData, pdfFilePath);
+
+        // Save mock test data to database
+        const mockTestRef = collection(db, 'mock_tests');
+        await addDoc(mockTestRef, {
+            test_id: testId,
+            user_id: String(user_id),
+            topic: String(topic),
+            difficulty: String(difficulty),
+            num_questions: Number(num_questions),
+            created_at: Timestamp.now(),
+            test_data: mockTestData.mock_test,
+            pdf_path: pdfFileName
+        });
+
+        // Decrement free usage if applicable
+        let remainingFree = usageStatus.remainingFree;
+        if (usageStatus.subscriptionStatus === 'free') {
+            remainingFree = await decrementFreeUsage(user_id);
+        }
+
+        res.status(201).json({
+            message: 'Mock test generated successfully',
+            test_id: testId,
+            download_link: `/api/mock-test/download/${testId}`,
+            topic,
+            difficulty,
+            num_questions,
+            subscription_status: usageStatus.subscriptionStatus,
+            remaining_free: remainingFree
+        });
+    } catch (error) {
+        console.error('Error generating mock test:', error);
+        res.status(500).json({
+            error: 'Error generating mock test',
+            details: error.message
+        });
+    }
+});
+
+// Download Mock Test PDF
+app.get('/api/mock-test/download/:testId', async (req, res) => {
+    const { testId } = req.params;
+    try {
+        // Get mock test data from database
+        const mockTestRef = collection(db, 'mock_tests');
+        const q = query(mockTestRef, where('test_id', '==', testId));
+        const querySnapshot = await getDocs(q);
+
+        if (querySnapshot.empty) {
+            return res.status(404).json({ error: 'Mock test not found' });
+        }
+
+        const mockTestDoc = querySnapshot.docs[0].data();
+        const pdfPath = path.join(uploadsDir, mockTestDoc.pdf_path);
+
+        if (!fs.existsSync(pdfPath)) {
+            return res.status(404).json({ error: 'PDF file not found' });
+        }
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename=mock_test_${testId}.pdf`);
+
+        const fileStream = fs.createReadStream(pdfPath);
+        fileStream.pipe(res);
+    } catch (error) {
+        console.error('Error downloading mock test:', error);
+        res.status(500).json({
+            error: 'Error downloading mock test',
+            details: error.message
+        });
+    }
+});
+
+// Get User's Mock Tests
+app.get('/api/mock-test/user/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const mockTestRef = collection(db, 'mock_tests');
+        const q = query(
+            mockTestRef,
+            where('user_id', '==', userId),
+            orderBy('created_at', 'desc'),
+            limit(10)
+        );
+        const querySnapshot = await getDocs(q);
+
+        const mockTests = querySnapshot.docs.map(doc => ({
+            test_id: doc.data().test_id,
+            topic: doc.data().topic,
+            difficulty: doc.data().difficulty,
+            num_questions: doc.data().num_questions,
+            created_at: doc.data().created_at.toDate(),
+            download_link: `/api/mock-test/download/${doc.data().test_id}`
+        }));
+
+        res.status(200).json(mockTests);
+    } catch (error) {
+        console.error('Error fetching user mock tests:', error);
+        res.status(500).json({
+            error: 'Error fetching mock tests',
+            details: error.message
+        });
     }
 });
 
