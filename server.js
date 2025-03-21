@@ -279,11 +279,11 @@ app.post('/api/upload_pdf', upload.single('pdf'), async (req, res) => {
                 subscription_status: usageStatus.subscriptionStatus,
                 remaining_free: usageStatus.remainingFree
             });
-        }
-        
-        // Validate and limit the number of questions
-        const numQuestions = Math.min(Math.max(parseInt(num_questions) || 10, 1), 50); // Min 1, Max 50 questions
-        const numOptions = Math.min(Math.max(parseInt(num_options) || 4, 2), 6); // Min 2, Max 6 options
+    }
+
+    // Validate and limit the number of questions
+    const numQuestions = Math.min(Math.max(parseInt(num_questions) || 10, 1), 50); // Min 1, Max 50 questions
+    const numOptions = Math.min(Math.max(parseInt(num_options) || 4, 2), 6); // Min 2, Max 6 options
 
         // Extract text from PDF
         const pdfData = await pdfParse(req.file.buffer);
@@ -896,5 +896,5 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", function () {
     console.log(`Server is running on port: ${PORT}`);
-});
+  });
 
